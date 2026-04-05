@@ -1,0 +1,282 @@
+---
+title: "Module_Seg"
+output: html_document
+date: "2025-08-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(bruceR)
+setwd("D:/youyi_fucha/code/")
+#data_all <- import("all_metric_data_sub.csv")
+#all_info_data <- import("first_all_subjects_info.xlsx")
+#data_all <- rename(data_all, participant = subname)
+#data_merge <- inner_join(data_all, all_info_data, by = c("group", "participant"))
+#export(data_merge,'data_merge_FC_seg_integ.xlsx')
+
+#data_merge <- inner_join(data_all, all_info_data, by = c("group", "participant")) %>%
+#  pivot_longer(cols = c(1:50), names_to = "Metrics", values_to = "Degree") %>%
+#  # 计算BMI (BMI = weight(kg) / height(m)^2)
+#  mutate(BMI = weight / (tall/100)^2)
+data_merge <-  import("data_merge_FC_seg_integ.xlsx")%>%
+  pivot_longer(cols = c(1:50), names_to = "Metrics", values_to = "Degree") %>%
+  # 计算BMI (BMI = weight(kg) / height(m)^2)
+  mutate(BMI = weight / (tall/100)^2)
+# 设置随机种子确保结果可重复
+set.seed(123)
+
+# 获取所有独特的指标
+unique_metrics <- unique(data_merge$Metrics)
+
+# 创建空的结果数据框
+linear_model_results <- data.frame(
+  Metrics = character(),
+  group_coef = numeric(),
+  group_se = numeric(),
+  group_t = numeric(),
+  group_p = numeric(),
+  r_squared = numeric(),
+  adj_r_squared = numeric(),
+  f_statistic = numeric(),
+  model_p = numeric(),
+  n_obs = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# 使用for循环处理每个指标
+for(i in 1:length(unique_metrics)) {
+  
+  current_metric <- unique_metrics[i]
+  
+  # 筛选当前指标的数据
+  current_data <- data_merge %>%
+    filter(Metrics == current_metric) %>%
+    # 去除缺失值
+    filter(!is.na(Degree))
+  
+  # 检查是否有足够的数据进行分析
+  if(nrow(current_data) < 10) {
+    cat("警告: 指标", current_metric, "的有效数据点少于10个，跳过分析\n")
+    next
+  }
+  
+  # 去除异常值（使用IQR方法）
+  Q1 <- quantile(current_data$Degree, 0.25, na.rm = TRUE)
+  Q3 <- quantile(current_data$Degree, 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  
+  # 过滤异常值
+  current_data_clean <- current_data %>%
+    filter(Degree >= lower_bound & Degree <= upper_bound)
+  
+  # 检查清理后是否还有足够的数据
+  if(nrow(current_data_clean) < 10) {
+    cat("警告: 指标", current_metric, "去除异常值后数据点少于10个，跳过分析\n")
+    next
+  }
+  
+  # 拟合线性模型
+  tryCatch({
+    model <- lm(Degree ~ group+years+education+BMI, data = current_data)
+    model_summary <- summary(model)
+    
+    # 检查group系数是否存在
+    if("groupSUB" %in% rownames(model_summary$coefficients)) {
+      # 提取group的系数信息
+      group_coef <- model_summary$coefficients["groupSUB", "Estimate"]
+      group_se <- model_summary$coefficients["groupSUB", "Std. Error"]
+      group_t <- model_summary$coefficients["groupSUB", "t value"]
+      group_p <- model_summary$coefficients["groupSUB", "Pr(>|t|)"]
+      
+      # 提取模型整体信息
+      r_squared <- model_summary$r.squared
+      adj_r_squared <- model_summary$adj.r.squared
+      f_statistic <- model_summary$fstatistic[1]
+      model_p <- pf(model_summary$fstatistic[1], 
+                    model_summary$fstatistic[2], 
+                    model_summary$fstatistic[3], 
+                    lower.tail = FALSE)
+      n_obs <- nobs(model)
+      
+      # 将结果添加到结果数据框
+      linear_model_results <- rbind(linear_model_results, data.frame(
+        Metrics = current_metric,
+        group_coef = group_coef,
+        group_se = group_se,
+        group_t = group_t,
+        group_p = group_p,
+        r_squared = r_squared,
+        adj_r_squared = adj_r_squared,
+        f_statistic = f_statistic,
+        model_p = model_p,
+        n_obs = n_obs,
+        stringsAsFactors = FALSE
+      ))
+      
+      cat("完成指标", i, "/", length(unique_metrics), ":", current_metric, 
+          "- p值:", round(group_p, 4), "\n")
+    } else {
+      cat("警告: 指标", current_metric, "的模型中没有group系数\n")
+    }
+    
+  }, error = function(e) {
+    cat("错误: 指标", current_metric, "模型拟合失败:", e$message, "\n")
+  })
+}
+
+# 进行FDR校正和添加显著性标记
+linear_model_results <- linear_model_results %>%
+  mutate(
+    group_p_fdr = p.adjust(group_p, method = "BH"),
+    # 添加显著性标记（未校正）
+    significance = case_when(
+      group_p < 0.001 ~ "***",
+      group_p < 0.01  ~ "**",
+      group_p < 0.05  ~ "*",
+      TRUE ~ "ns"
+    ),
+    # 添加显著性标记（FDR校正后）
+    significance_fdr = case_when(
+      group_p_fdr < 0.001 ~ "***",
+      group_p_fdr < 0.01  ~ "**",
+      group_p_fdr < 0.05  ~ "*",
+      TRUE ~ "ns"
+    )
+  ) %>%
+  # 按p值排序
+  arrange(group_p)
+
+# 查看结果
+print(linear_model_results)
+
+# 筛选出显著的组间差异（未校正）
+significant_metrics <- linear_model_results %>%
+  filter(group_p < 0.05) %>%
+  select(Metrics, group_coef, group_p, significance)
+
+cat("\n显著的组间差异指标（未校正）:\n")
+print(significant_metrics)
+
+# 筛选出FDR校正后显著的组间差异
+significant_metrics_fdr <- linear_model_results %>%
+  filter(group_p_fdr < 0.05) %>%
+  select(Metrics, group_coef, group_p, group_p_fdr, significance_fdr)
+
+
+
+cat("\nFDR校正后显著的组间差异指标:\n")
+print(significant_metrics_fdr)
+
+# 保存结果
+write.csv(linear_model_results, "linear_model_group_effects_BMI.csv", row.names = FALSE)
+write.csv(significant_metrics_fdr, "significant_group_differences_fdr_BMI.csv", row.names = FALSE)
+
+# 创建可视化
+library(ggplot2)
+
+# 火山图显示效应大小和显著性
+volcano_plot <- linear_model_results %>%
+  mutate(
+    log10_p = -log10(group_p),
+    significant_group = case_when(
+      group_p_fdr < 0.05 & group_coef > 0 ~ "显著上调",
+      group_p_fdr < 0.05 & group_coef < 0 ~ "显著下调",
+      TRUE ~ "不显著"
+    )
+  ) %>%
+  ggplot(aes(x = group_coef, y = log10_p, color = significant_group)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey") +
+  scale_color_manual(values = c("显著上调" = "#E31A1C", 
+                                "显著下调" = "#1F78B4", 
+                                "不显著" = "grey60")) +
+  labs(x = "组间效应大小 (回归系数)", 
+       y = "-log10(p值)",
+       title = "组间差异火山图 (控制education, years, BMI)",
+       color = "显著性类别") +
+  theme_classic(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(volcano_plot)
+
+# 显示总结信息
+cat("\n=== 分析总结 ===\n")
+cat("总共分析了", nrow(linear_model_results), "个指标\n")
+cat("未校正时显著的指标数:", sum(linear_model_results$group_p < 0.05), "\n")
+cat("FDR校正后显著的指标数:", sum(linear_model_results$group_p_fdr < 0.05), "\n")
+cat("协变量: education, years, BMI\n")
+```
+
+
+```{r}
+for (Metricname in significant_metrics_fdr$Metrics) {
+    
+    data_select <- data_merge %>% filter(Metrics==Metricname)
+    Q1 <- quantile(data_select$Degree, 0.25, na.rm = TRUE)
+    Q3 <- quantile(data_select$Degree, 0.75, na.rm = TRUE)
+    IQR <- Q3 - Q1
+    lower_bound <- Q1 - 1.5 * IQR
+    upper_bound <- Q3 + 1.5 * IQR
+    
+    # 过滤异常值
+    data_select_clean <- data_select %>%
+      filter(Degree >= lower_bound & Degree <= upper_bound)
+    
+    data_select_clean %>%  ggplot( aes(x = group, y = Degree,fill = group,color=group)) +
+    geom_boxplot(color="grey30",width=0.2,position = position_nudge(x=-0.2),alpha=0.8)+
+    PupillometryR::geom_flat_violin(color="white",position = position_nudge(x=0),alpha=0.8)+
+    geom_point(color="grey60",shape=19,size=3.2,
+               position = position_jitter(width = 0.1),alpha=0.3)+
+    theme_classic(base_size = 20) +
+    theme(legend.position = "none") +
+    labs(x = "Group", y = Metricname)+
+    scale_fill_manual(values = c("#e88936", "#619bc1")) +
+    scale_color_manual(values = c("#e88936", "#619bc1"))+
+    theme_classic()+
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "bottom"
+    )-> figure_metric
+    ggsave(
+    filename = paste0(Metricname,"_Groupdiff.pdf"),
+    plot = figure_metric,
+    width = 4,
+    height = 5
+)
+}
+```
+
+
+
+# below analysis were dropped in final paper.
+```{r}
+data_merge <- inner_join(data_all, all_info_data, by = c("group", "participant")) %>% dplyr::select(c(significant_metrics_fdr$Metrics,names(all_info_data)[11:20],"group","years","education"))
+data_merge %>% export("D:/youyi_fucha/code/Segregation_Integeration_datainfo.xlsx")
+
+data_merge_clean <- data_merge %>% filter(Deafualt_S_all>0.4) # excluded the outlier
+GLM_summary(lm(EAT_26~Deafualt_S_all*group,data_merge_clean))
+interactions::sim_slopes(lm(EAT_26~Deafualt_S_all*group,data_merge_clean),pred = "Deafualt_S_all",modx = "group")
+```
+
+
+```{r}
+data_merge %>% ggplot(aes(x=Deafualt_S_all, EAT_26,group = group,color=group))+geom_point(size = 5,aes(shape=group))+
+  geom_smooth(method = "lm")+theme_classic(base_size = 20)+
+    scale_fill_manual(values = c("#e88936", "#619bc1")) +
+    scale_color_manual(values = c("#e88936", "#619bc1"))
+```
+
+
+```{r}
+data_merge %>% ggplot(aes(x=Deafualt_S_all, EAT_26))+geom_point(size = 5,aes(shape=group))+
+  geom_smooth(method = "lm")+theme_classic(base_size = 20)+
+    scale_fill_manual(values = c("#e88936")) +
+    scale_color_manual(values = c("#e88936"))
+```
